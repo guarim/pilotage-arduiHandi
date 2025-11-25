@@ -1,216 +1,454 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="fr">
 <head>
-    <meta charset="UTF-8">
-    <title>Contrôle Facial - Bouche & Iris by Guarim</title>
-    <style>
-        body { font-family: monospace; background: #222; color: #fff; text-align: center; }
-        video { transform: scaleX(-1); display: none; } /* Miroir, caché car on dessine sur le canvas */
-        canvas { transform: scaleX(-1); border: 2px solid #555; max-width: 100%; }
-        #status { margin: 20px; font-size: 1.2em; padding: 10px; border: 1px solid #fff; }
-        button { padding: 15px; font-size: 1.2em; cursor: pointer; background: #007bff; color: white; border: none; }
-        .active { color: #0f0; }
-        .inactive { color: #f00; }
-    </style>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <meta charset="utf-8" />
+  <title>Contrôle Arduino par visage (iris / yeux / bouche)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body {font-family: Arial, Helvetica, sans-serif; margin: 0; display:flex; height:100vh;}
+    #left {flex:1; background:#111; color:#eee; display:flex; flex-direction:column; align-items:center; padding:10px;}
+    #videoCanvas {width: 100%; max-width:900px; border-radius:8px;}
+    #controls {margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;}
+    button {padding:8px 12px; border-radius:6px; border:none; cursor:pointer;}
+    #logs {margin-top:10px; width:100%; max-width:900px; height:120px; overflow:auto; background:#000; color:#0f0; padding:8px; font-family: monospace; font-size:12px; border-radius:6px;}
+    #right {width:320px; background:#f4f4f4; padding:12px; box-shadow: -2px 0 6px rgba(0,0,0,0.12);}
+    .stat {margin-bottom:8px;}
+    label{display:block;font-size:13px;margin-bottom:4px;}
+    input[type=range]{width:100%;}
+  </style>
 </head>
 <body>
+  <div id="left">
+    <canvas id="videoCanvas" width="1280" height="720"></canvas>
+    <div id="controls">
+      <button id="btnConnect">Connecter port série</button>
+      <button id="btnStart">Forcer START</button>
+      <button id="btnStop">STOP</button>
+      <button id="btnCalibrate">Calibrer position iris</button>
+    </div>
+    <div id="logs"></div>
+  </div>
 
-    <h1>Interface de Contrôle : Bouche & Iris par M Guarim</h1>
-    <button id="connectBtn">🔌 Connecter Arduino (USB)</button>
-    <div id="status">Système: <span class="inactive">EN ATTENTE</span> | Arduino: <span class="inactive">DÉCONNECTÉ</span></div>
-    <div id="debug">...</div>
+  <div id="right">
+    <h3>Statut</h3>
+    <div class="stat">Programme actif : <span id="statActive">NON</span></div>
+    <div class="stat">Sortie1 (program on) : <span id="stat1">OFF</span></div>
+    <div class="stat">Sortie2 (eye left + iris right → gauche) : <span id="stat2">OFF</span></div>
+    <div class="stat">Sortie3 (eye left + iris right → droite) : <span id="stat3">OFF</span></div>
+    <hr/>
+    <label>Seuil bouche (ouverture)</label>
+    <input type="range" id="thMouth" min="0.01" max="0.12" step="0.005" value="0.045">
+    <label>Seuil déplacement iris (ratio)</label>
+    <input type="range" id="thIris" min="0.05" max="0.5" step="0.01" value="0.14">
+    <hr/>
+    <div>Instructions :</div>
+    <ul>
+      <li>Ouvre la bouche → démarre le programme (ou appuie Forcer START).</li>
+      <li>Ferme l’œil gauche et regarde à gauche/droite (iris droit se déplace) → sortie 2/3.</li>
+      <li>Regarde centre → sorties 2/3 off.</li>
+      <li>Ferme les deux yeux 2s → arrête toutes les sorties.</li>
+    </ul>
+  </div>
 
-    
-    <video id="input_video" width="640" height="480" autoplay></video>
-    <canvas id="output_canvas" width="640" height="480"></canvas>
-    
-    <!--canvas id="output_canvas" width="640" height="480"></canvas>
-    <video id="input_video" width="640" height="480" autoplay muted></video>-->
+<script type="module">
+  // ----------------------------
+  // Imports MediaPipe via CDN (ES module)
+  // ----------------------------
+  import {FaceMesh} from "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/face_mesh.js";
+  import {Camera} from "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.4/camera_utils.js";
+  import {drawConnectors, drawLandmarks} from "https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.4/drawing_utils.js";
 
-<script>
-    const videoElement = document.getElementById('input_video');
-    const canvasElement = document.getElementById('output_canvas');
-    const canvasCtx = canvasElement.getContext('2d');
-    const statusDiv = document.getElementById('status');
-    const debugDiv = document.getElementById('debug');
-    
-    // --- Variables de Logique ---
-    let port, writer;
-    let isSystemActive = false; // Le programme est-il lancé ?
-    let eyesClosedStartTime = 0; // Timer pour les 3 secondes
-    const EYES_CLOSED_LIMIT = 3000; // 3000 ms = 3 sec
+  // ----------------------------
+  // DOM
+  // ----------------------------
+  const canvas = document.getElementById('videoCanvas');
+  const ctx = canvas.getContext('2d');
+  const logs = document.getElementById('logs');
+  const btnConnect = document.getElementById('btnConnect');
+  const btnStart = document.getElementById('btnStart');
+  const btnStop = document.getElementById('btnStop');
+  const btnCalibrate = document.getElementById('btnCalibrate');
+  const statActive = document.getElementById('statActive');
+  const stat1 = document.getElementById('stat1');
+  const stat2 = document.getElementById('stat2');
+  const stat3 = document.getElementById('stat3');
+  const thMouth = document.getElementById('thMouth');
+  const thIris = document.getElementById('thIris');
 
-    // Seuils de détection (à ajuster selon la lumière/visage)
-    const MOUTH_OPEN_THRESHOLD = 0.05; // Ratio hauteur bouche
-    const EYE_CLOSED_THRESHOLD = 0.14; // Ratio hauteur œil (EAR)
-    const IRIS_LEFT_THRESHOLD = 0.40; // Seuil pour regarder à gauche
-    const IRIS_RIGHT_THRESHOLD = 0.60; // Seuil pour regarder à droite
+  // ----------------------------
+  // State variables
+  // ----------------------------
+  let programActive = false;
+  let serialPort = null;
+  let serialWriter = null;
 
-    // Indices des points MediaPipe
-    const UPPER_LIP = 13;
-    const LOWER_LIP = 14;
-    // Oeil Gauche (Left Eye)
-    const LEFT_EYE_TOP = 159;
-    const LEFT_EYE_BOTTOM = 145;
-    // Oeil Droit (Right Eye)
-    const RIGHT_EYE_INDICES = [33, 133]; // Coins horizontal
-    const RIGHT_EYE_TOP = 386;
-    const RIGHT_EYE_BOTTOM = 374; // Attention indices inversés parfois selon modèle
-    // Iris Droit
-    const RIGHT_IRIS = 473; 
+  // outputs state
+  let out1 = false, out2 = false, out3 = false;
 
-    // --- Web Serial API (Connexion Arduino) ---
-    document.getElementById('connectBtn').addEventListener('click', async () => {
+  // For eye/brow detection thresholds
+  let mouthThreshold = parseFloat(thMouth.value); // ratio between lip dist and face size
+  let irisThreshold = parseFloat(thIris.value);   // relative shift to left/right
+
+  thMouth.oninput = ()=> { mouthThreshold = parseFloat(thMouth.value); log('Seuil bouche = ' + mouthThreshold.toFixed(3)); };
+  thIris.oninput = ()=> { irisThreshold = parseFloat(thIris.value); log('Seuil iris = ' + irisThreshold.toFixed(3)); };
+
+  // We'll record initial right iris center when program starts (calibration)
+  let irisRightHomeX = null;
+  let irisRightHomeY = null;
+
+  // For detecting both eyes closed for 2 seconds
+  let bothEyesClosedStart = null;
+
+  // Helper logging
+  function log(msg){
+    const t = new Date().toLocaleTimeString();
+    logs.textContent = `[${t}] ${msg}\n` + logs.textContent;
+  }
+
+  // ----------------------------
+  // Web Serial functions
+  // ----------------------------
+  async function connectSerial() {
+    try {
+      serialPort = await navigator.serial.requestPort();
+      await serialPort.open({ baudRate: 115200 });
+      serialWriter = serialPort.writable.getWriter();
+      log('Port série connecté (baud 115200)');
+      // start read loop to flush incoming messages (optional)
+      readFromSerial(serialPort);
+    } catch (e) {
+      log('Erreur connexion série: ' + e.message);
+    }
+  }
+
+  async function disconnectSerial() {
+    try {
+      if (serialWriter) { await serialWriter.releaseLock(); serialWriter = null; }
+      if (serialPort) { await serialPort.close(); serialPort = null; }
+      log('Port série déconnecté');
+    } catch (e) {
+      log('Erreur déconnexion: ' + e.message);
+    }
+  }
+
+  async function readFromSerial(port){
+    try {
+      while(port.readable){
+        const reader = port.readable.getReader();
         try {
-            port = await navigator.serial.requestPort();
-            await port.open({ baudRate: 9600 });
-            writer = port.writable.getWriter();
-            statusDiv.innerHTML = statusDiv.innerHTML.replace('Arduino: <span class="inactive">DÉCONNECTÉ</span>', 'Arduino: <span class="active">CONNECTÉ</span>');
-        } catch (e) {
-            alert("Erreur connexion: " + e);
+          while(true){
+            const {value, done} = await reader.read();
+            if (done) break;
+            if (value) {
+              const txt = new TextDecoder().decode(value);
+              log('Arduino >> ' + txt.trim());
+            }
+          }
+        } finally {
+          reader.releaseLock();
         }
-    });
+      }
+    } catch (e) {
+      log('Lecture série terminée: ' + e.message);
+    }
+  }
 
-    async function sendCommand(cmd) {
-        if (!writer) return;
-        const data = new TextEncoder().encode(cmd + "\n");
-        await writer.write(data);
+  async function sendCommand(cmd){
+    if (!serialWriter) { log('Pas de connexion série - commande non envoyée: ' + cmd); return; }
+    try {
+      const data = new TextEncoder().encode(cmd + '\n');
+      await serialWriter.write(data);
+      log('-> ' + cmd);
+    } catch (e) {
+      log('Erreur envoi commande: ' + e.message);
+    }
+  }
+
+  // UI buttons
+  btnConnect.addEventListener('click', async () => {
+    if (!serialPort) {
+      await connectSerial();
+      btnConnect.textContent = 'Déconnecter port série';
+    } else {
+      await disconnectSerial();
+      btnConnect.textContent = 'Connecter port série';
+    }
+  });
+
+  btnStart.addEventListener('click', ()=> {
+    if (!programActive) startProgram();
+    else log('Programme déjà actif');
+  });
+
+  btnStop.addEventListener('click', ()=> {
+    stopProgram();
+  });
+
+  btnCalibrate.addEventListener('click', ()=> {
+    irisRightHomeX = null; irisRightHomeY = null;
+    log('Réinitialisation calibration iris (la prochaine détection calibrera la position initiale).');
+  });
+
+  // ----------------------------
+  // Arduino control helpers (sémantique)
+  // ----------------------------
+  async function setOutput1(on){
+    out1 = on;
+    stat1.textContent = on ? 'ON' : 'OFF';
+    await sendCommand(on ? 'OUT1_ON' : 'OUT1_OFF');
+  }
+  async function setOutput2(on){
+    out2 = on;
+    stat2.textContent = on ? 'ON' : 'OFF';
+    await sendCommand(on ? 'OUT2_ON' : 'OUT2_OFF');
+  }
+  async function setOutput3(on){
+    out3 = on;
+    stat3.textContent = on ? 'ON' : 'OFF';
+    await sendCommand(on ? 'OUT3_ON' : 'OUT3_OFF');
+  }
+  async function allOff(){
+    out1 = out2 = out3 = false;
+    stat1.textContent = stat2.textContent = stat3.textContent = 'OFF';
+    await sendCommand('ALL_OFF');
+  }
+
+  // Program-level start/stop
+  async function startProgram(){
+    programActive = true;
+    statActive.textContent = 'OUI';
+    log('Programme démarré.');
+    await setOutput1(true); // première sortie on
+    // calibrate iris home when available (will be set on next detection)
+    irisRightHomeX = null;
+    irisRightHomeY = null;
+    await sendCommand('PROGRAM_ON'); // message optionnel à Arduino
+  }
+
+  async function stopProgram(){
+    programActive = false;
+    statActive.textContent = 'NON';
+    log('Programme stoppé.');
+    await allOff();
+    await sendCommand('PROGRAM_OFF');
+  }
+
+  // ----------------------------
+  // MediaPipe FaceMesh setup
+  // ----------------------------
+  const faceMesh = new FaceMesh({
+    locateFile: (file) => {
+      return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`;
+    }
+  });
+
+  faceMesh.setOptions({
+    maxNumFaces: 1,
+    refineLandmarks: true, // important: provides iris landmarks
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+
+  faceMesh.onResults(onResults);
+
+  // Start camera
+  const videoElement = document.createElement('video');
+  videoElement.style.display = 'none';
+  document.body.appendChild(videoElement);
+
+  const camera = new Camera(videoElement, {
+    onFrame: async () => {
+      await faceMesh.send({image: videoElement});
+    },
+    width: 1280,
+    height: 720
+  });
+  await camera.start();
+
+  // ----------------------------
+  // Landmark indices (MediaPipe FaceMesh):
+  // NOTE: ces indices sont les conventions courantes:
+  // - iris droit : 473..477 (moyenne pour centre)
+  // - iris gauche : 468..472
+  // - bouche: landmarks 13 (upper), 14 (lower) (approximatif)
+  // - yeux (pour mesurer ouverture) : 
+  //   - oeil gauche (viewer left): top ~159, bottom ~145
+  //   - oeil droit (viewer right): top ~386, bottom ~374
+  // Ces indices sont utilisés dans beaucoup d'exemples FaceMesh "refineLandmarks=true".
+  // Si le comportement est instable, ajuste les indices et les seuils commentés plus bas.
+  // ----------------------------
+  const IDX = {
+    mouthUp: 13,
+    mouthDown: 14,
+    leftEyeTop: 159,
+    leftEyeBottom: 145,
+    rightEyeTop: 386,
+    rightEyeBottom: 374,
+    irisLeft: [468,469,470,471,472],
+    irisRight: [473,474,475,476,477]
+  };
+
+  // Utility: moyenne de points
+  function avgPoint(landmarks, indices) {
+    let x = 0, y = 0;
+    for (const i of indices) { x += landmarks[i].x; y += landmarks[i].y; }
+    return {x: x/indices.length, y: y/indices.length};
+  }
+
+  // Distance helper (2D)
+  function dist(a,b){
+    const dx = (a.x - b.x);
+    const dy = (a.y - b.y);
+    return Math.sqrt(dx*dx + dy*dy);
+  }
+
+  // Main results handler
+  async function onResults(results){
+    // clear
+    ctx.save();
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    // draw mirrored video
+    ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+    ctx.globalCompositeOperation = 'lighter';
+
+    if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+      ctx.restore();
+      // if face lost, do not change outputs automatically (except optional safety)
+      return;
     }
 
-    // --- Fonctions Mathématiques ---
-    function distance(p1, p2) {
-        return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+    const landmarks = results.multiFaceLandmarks[0]; // array of {x,y,z} normalized (0..1)
+    // convert to pixel coords
+    const toPixel = (p) => ({x: p.x * canvas.width, y: p.y * canvas.height});
+
+    // Draw only required points:
+    // 1) mouth points (up/down)
+    const mouthUp = toPixel(landmarks[IDX.mouthUp]);
+    const mouthDown = toPixel(landmarks[IDX.mouthDown]);
+    drawCircle(mouthUp, 4, 'yellow');
+    drawCircle(mouthDown, 4, 'yellow');
+
+    // 2) iris centers
+    const irisR = avgPoint(landmarks, IDX.irisRight);
+    const irisL = avgPoint(landmarks, IDX.irisLeft);
+    const irisRpx = toPixel(irisR);
+    const irisLpx = toPixel(irisL);
+    drawCircle(irisRpx, 6, 'cyan');
+    drawCircle(irisLpx, 6, 'cyan');
+
+    // 3) eye top/bottom for left/right
+    const leftEyeTop = toPixel(landmarks[IDX.leftEyeTop]);
+    const leftEyeBottom = toPixel(landmarks[IDX.leftEyeBottom]);
+    const rightEyeTop = toPixel(landmarks[IDX.rightEyeTop]);
+    const rightEyeBottom = toPixel(landmarks[IDX.rightEyeBottom]);
+    drawCircle(leftEyeTop,3,'magenta'); drawCircle(leftEyeBottom,3,'magenta');
+    drawCircle(rightEyeTop,3,'magenta'); drawCircle(rightEyeBottom,3,'magenta');
+
+    // measure mouth open ratio: distance between mouthUp & mouthDown divided by face height (approx)
+    const mouthDistPx = dist(mouthUp, mouthDown);
+    // use distance between forehead (10) and chin (152) as face height approx (if available)
+    let faceHeightPx = null;
+    if (landmarks[10] && landmarks[152]) {
+      faceHeightPx = dist(toPixel(landmarks[10]), toPixel(landmarks[152]));
+    } else {
+      faceHeightPx = canvas.height; // fallback
+    }
+    const mouthRatio = mouthDistPx / faceHeightPx;
+    // draw mouth ratio text
+    ctx.fillStyle = 'yellow';
+    ctx.font = '14px monospace';
+    ctx.fillText('Mouth ratio: ' + mouthRatio.toFixed(3), 10, 20);
+
+    // Measure eye openness (use top-bottom distance normalized by faceHeight)
+    const leftEyeOpen = dist(leftEyeTop, leftEyeBottom) / faceHeightPx;
+    const rightEyeOpen = dist(rightEyeTop, rightEyeBottom) / faceHeightPx;
+    ctx.fillStyle = 'magenta';
+    ctx.fillText('Leye open: ' + leftEyeOpen.toFixed(3), 10, 40);
+    ctx.fillText('Reye open: ' + rightEyeOpen.toFixed(3), 10, 60);
+
+    // Detect mouth open -> start program if not active
+    if (!programActive && mouthRatio > mouthThreshold) {
+      await startProgram();
     }
 
-    // Calcul de l'ouverture d'un oeil (Eye Aspect Ratio simplifié vertical)
-    function getEyeOpenness(landmarks, topIdx, bottomIdx) {
-        return distance(landmarks[topIdx], landmarks[bottomIdx]);
-    }
+    // If programActive, ensure output1 true (redundant but safe)
+    if (programActive && !out1) { await setOutput1(true); }
 
-    // Position relative de l'iris (0.0 = Gauche, 1.0 = Droite, 0.5 = Centre)
-    function getIrisPosition(landmarks, irisIdx, leftCornerIdx, rightCornerIdx) {
-        const iris = landmarks[irisIdx];
-        const leftCorner = landmarks[leftCornerIdx];
-        const rightCorner = landmarks[rightCornerIdx];
-        
-        // Projection simple sur l'axe X
-        const totalWidth = rightCorner.x - leftCorner.x;
-        const currentPos = iris.x - leftCorner.x;
-        return currentPos / totalWidth; 
-    }
+    // If not active, ignore eye gestures (but still render)
+    if (programActive) {
+      // calibrate iris home if not set (first valid frame after start)
+      if (irisRightHomeX === null) {
+        irisRightHomeX = irisR.x; irisRightHomeY = irisR.y;
+        log('Calibration iris droit : x=' + irisRightHomeX.toFixed(3));
+      }
 
-    // --- Boucle Principale MediaPipe ---
-    function onResults(results) {
-        canvasCtx.save();
-        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+      // compute iris horizontal displacement relative to home
+      const dx = irisR.x - irisRightHomeX; // normalized -1..1
+      // positive dx => iris moved right (viewer right); negative dx => left
+      ctx.fillStyle = 'white';
+      ctx.fillText('Iris dx: ' + dx.toFixed(3), 10, 80);
 
-        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
-            const landmarks = results.multiFaceLandmarks[0];
-
-            // 1. Détection États
-            // Bouche
-            const mouthDist = distance(landmarks[UPPER_LIP], landmarks[LOWER_LIP]);
-            const isMouthOpen = mouthDist > MOUTH_OPEN_THRESHOLD;
-
-            // Yeux (Indices standard MediaPipe pour verticalité)
-            const leftEyeHeight = distance(landmarks[159], landmarks[145]); 
-            const rightEyeHeight = distance(landmarks[386], landmarks[374]);
-            
-            const isLeftEyeClosed = leftEyeHeight < EYE_CLOSED_THRESHOLD;
-            const isRightEyeClosed = rightEyeHeight < EYE_CLOSED_THRESHOLD;
-            const areBothClosed = isLeftEyeClosed && isRightEyeClosed;
-
-            // Iris Droit (Position relative)
-            // Note: landmarks[33] est le coin intérieur (gauche écran), landmarks[133] coin extérieur (droit écran)
-            const irisPos = getIrisPosition(landmarks, RIGHT_IRIS, 33, 133);
-            
-            // --- Logique du Scénario ---
-            
-            // Sécurité : Fermeture des deux yeux pendant 3s
-            if (areBothClosed) {
-                if (eyesClosedStartTime === 0) eyesClosedStartTime = Date.now();
-                else if (Date.now() - eyesClosedStartTime > EYES_CLOSED_LIMIT) {
-                    if (isSystemActive) {
-                        isSystemActive = false;
-                        sendCommand("CMD_STOP_ALL"); // Désactive tout
-                        console.log("STOP TOTAL");
-                    }
-                }
-            } else {
-                eyesClosedStartTime = 0; // Reset timer
-            }
-
-            // Lancement du programme (Bouche ouverte)
-            if (!isSystemActive && isMouthOpen && !areBothClosed) {
-                isSystemActive = true;
-                sendCommand("CMD_START"); // Sortie 1 ON
-                console.log("START PROGRAM");
-            }
-
-            // Pilotage si actif
-            if (isSystemActive && !areBothClosed) {
-                
-                // Condition: Oeil Gauche Fermé
-                if (isLeftEyeClosed) {
-                    // Attention: "Gauche" pour l'utilisateur est "Droite" à l'écran si non-miroir.
-                    // Ici on utilise le repère mathématique irisPos (0 à 1).
-                    // 0 = vers le coin intérieur (gauche utilisateur), 1 = coin extérieur (droite utilisateur)
-                    
-                    if (irisPos < IRIS_LEFT_THRESHOLD) {
-                        // Iris vers la gauche
-                        sendCommand("CMD_OUT2_ON"); 
-                        debugDiv.innerText = "Action: Sortie 2 (Gauche)";
-                    } else if (irisPos > IRIS_RIGHT_THRESHOLD) {
-                        // Iris vers la droite
-                        sendCommand("CMD_OUT3_ON");
-                        debugDiv.innerText = "Action: Sortie 3 (Droite)";
-                    } else {
-                        // Position initiale (centre)
-                        sendCommand("CMD_OUT23_OFF");
-                        debugDiv.innerText = "Action: Centre (Off 2&3)";
-                    }
-                } else {
-                    // Si l'œil gauche n'est pas fermé, on peut décider de couper 2 et 3 ou de laisser l'état précédent.
-                    // Selon ton texte : "si iris revient en position initiale" -> on coupe.
-                    // On peut assumer que si l'œil s'ouvre, on arrête de piloter.
-                    sendCommand("CMD_OUT23_OFF");
-                }
-            }
-
-            // Feedback Visuel
-            drawConnectors(canvasCtx, landmarks, FACEMESH_TESSELATION, {color: '#C0C0C070', lineWidth: 1});
-            drawConnectors(canvasCtx, landmarks, FACEMESH_RIGHT_IRIS, {color: '#FF3030', lineWidth: 2});
-            
-            // Affichage état
-            statusDiv.innerHTML = `Système: <span class="${isSystemActive ? 'active' : 'inactive'}">${isSystemActive ? 'ACTIF' : 'ARRÊT'}</span> | ` +
-                                  `Mouth: ${isMouthOpen.toFixed(2)} | L-Eye Closed: ${isLeftEyeClosed} | Iris: ${irisPos.toFixed(2)}`;
+      // if iris returns near home -> disable out2/out3
+      if (Math.abs(dx) < irisThreshold/2) {
+        if (out2 || out3) {
+          await setOutput2(false);
+          await setOutput3(false);
+          log('Iris revenu centre -> sorties 2 & 3 OFF');
         }
-        canvasCtx.restore();
+      } else {
+        // Check left-eye closed AND iris moved left/right
+        const leftClosed = leftEyeOpen < 0.015; // small threshold (tunable)
+        // NOTE: leftEyeOpen is normalized by faceHeight; adjust constant if needed.
+        if (leftClosed && dx < -irisThreshold) {
+          // iris right moved to viewer-left
+          await setOutput2(true);
+          await setOutput3(false);
+        } else if (leftClosed && dx > irisThreshold) {
+          // iris right moved to viewer-right
+          await setOutput3(true);
+          await setOutput2(false);
+        } else {
+          // when left not closed or not significant dx, we may keep previous outputs or turn off
+          // keep them as is unless iris near center above handled
+        }
+      }
+
+      // Detect both eyes closed for 2 seconds -> allOff
+      const bothClosed = (leftEyeOpen < 0.015) && (rightEyeOpen < 0.015);
+      if (bothClosed) {
+        if (bothEyesClosedStart === null) bothEyesClosedStart = performance.now();
+        else {
+          const dt = performance.now() - bothEyesClosedStart;
+          if (dt > 2000) {
+            log('Deux yeux fermés > 2s -> arrêt de toutes les sorties');
+            await allOff();
+            // keep programActive state? spec demande "désactive toutes les sorties" -> on laisse programme actif
+            bothEyesClosedStart = null; // reset
+          }
+        }
+      } else {
+        bothEyesClosedStart = null;
+      }
     }
 
-    const faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
-    faceMesh.setOptions({
-        maxNumFaces: 1,
-        refineLandmarks: true, // Important pour l'iris
-        minDetectionConfidence: 0.5,
-        minTrackingConfidence: 0.5
-    });
-    faceMesh.onResults(onResults);
+    ctx.restore();
+  }
 
-    const camera = new Camera(videoElement, {
-        onFrame: async () => { await faceMesh.send({image: videoElement}); },
-        width: 640,
-        height: 480
-    });
-    camera.start();
+  function drawCircle(p, r, color){
+    ctx.beginPath();
+    ctx.fillStyle = color;
+    ctx.arc(p.x, p.y, r, 0, Math.PI*2);
+    ctx.fill();
+  }
 
+  // On unload, try to close serial properly
+  window.addEventListener('beforeunload', async () => {
+    try { if (serialWriter) await serialWriter.releaseLock(); if (serialPort) await serialPort.close(); } catch(e){}
+  });
+
+  // Initial log
+  log('Page prête. Autorise la caméra et le port série si nécessaire.');
 </script>
+
 </body>
 </html>
-
-
-
