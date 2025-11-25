@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>Face → Arduino Control (Final)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body {margin:0; font-family:Arial; background:#222; color:white; display:flex;}
+    #left {flex:1; padding:10px; text-align:center;}
+    #right {width:320px; background:#333; padding:10px;}
+    #videoCanvas {width:100%; max-width:900px; border-radius:10px;}
+    #controls button {padding:8px 12px; margin:4px;}
+    #logs {height:150px; background:black; color:#0f0; font-family:monospace; overflow:auto; padding:6px; border-radius:6px;}
+    span.on {color:#0f0;} span.off {color:#f33;}
+  </style>
+</head>
+<body>
+
+<div id="left">
+  <canvas id="videoCanvas" width="1280" height="720"></canvas>
+
+  <div id="controls">
+    <button id="btnConnect">Connecter Arduino</button>
+    <button id="btnStart">Forcer START</button>
+    <button id="btnStop">STOP</button>
+    <button id="btnCalibrate">Calibrer iris</button>
+  </div>
+
+  <div id="logs"></div>
+</div>
+
+<div id="right">
+  <h3>STATUT</h3>
+  Programme actif : <span id="statActive" class="off">NON</span><br>
+  Sortie 1 : <span id="stat1" class="off">OFF</span><br>
+  Sortie 2 : <span id="stat2" class="off">OFF</span><br>
+  Sortie 3 : <span id="stat3" class="off">OFF</span><br>
+
+  <h3>Seuils</h3>
+  Bouche (ratio) : <input type="range" id="thMouth" min="0.02" max="0.15" step="0.005" value="0.055"><br>
+  Iris déplacement : <input type="range" id="thIris" min="0.05" max="0.5" step="0.01" value="0.16"><br>
+
+  <hr>
+  <b>GESTES :</b>
+  <ul>
+    <li>Ouvrir bouche → Start</li>
+    <li>Fermer œil gauche + iris droit à gauche → Sortie 2</li>
+    <li>Fermer œil gauche + iris droit à droite → Sortie 3</li>
+    <li>Iris au centre → Sorties 2 & 3 OFF</li>
+    <li>Fermer les 2 yeux 2s → Tout OFF</li>
+  </ul>
+</div>
+
+<script type="module">
+/* ----------------------------------------
+   IMPORT MEDIAPIPE MODULES
+---------------------------------------- */
+import {FaceMesh} from "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/face_mesh.js";
+import {drawLandmarks} from "https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.4/drawing_utils.js";
+
+/* ----------------------------------------
+   DOM + VARIABLES
+---------------------------------------- */
+const canvas = document.getElementById("videoCanvas");
+const ctx = canvas.getContext("2d");
+const logs = document.getElementById("logs");
+const stat1 = document.getElementById("stat1");
+const stat2 = document.getElementById("stat2");
+const stat3 = document.getElementById("stat3");
+const statActive = document.getElementById("statActive");
+
+const thMouth = document.getElementById("thMouth");
+const thIris  = document.getElementById("thIris");
+
+let programActive = false;
+let port = null;
+let writer = null;
+
+// états sorties
+let out1=false,out2=false,out3=false;
+
+// calibration IRIS
+let irisHomeX = null;
+
+// pour détecter yeux fermés 2s
+let bothClosedStart = null;
+
+// log
+function log(msg){
+  logs.textContent = msg+"\n"+logs.textContent;
+}
+
+// envoi série
+async function send(cmd){
+  if(!writer) return;
+  await writer.write(new TextEncoder().encode(cmd+"\n"));
+  log("→ "+cmd);
+}
+
+/* ----------------------------------------
+   ARDUINO CONTROL
+---------------------------------------- */
+async function setOut1(v){ out1=v; stat1.className=v?"on":"off"; stat1.textContent=v?"ON":"OFF"; await send(v?"OUT1_ON":"OUT1_OFF"); }
+async function setOut2(v){ out2=v; stat2.className=v?"on":"off"; stat2.textContent=v?"ON":"OFF"; await send(v?"OUT2_ON":"OUT2_OFF"); }
+async function setOut3(v){ out3=v; stat3.className=v?"on":"off"; stat3.textContent=v?"ON":"OFF"; await send(v?"OUT3_ON":"OUT3_OFF"); }
+
+async function allOff(){
+  await setOut1(false);
+  await setOut2(false);
+  await setOut3(false);
+  await send("ALL_OFF");
+}
+
+async function startProgram(){
+  programActive = true;
+  statActive.className = "on";
+  statActive.textContent = "OUI";
+  irisHomeX = null;
+  await setOut1(true);
+  await send("PROGRAM_ON");
+}
+
+async function stopProgram(){
+  programActive = false;
+  statActive.className = "off";
+  statActive.textContent = "NON";
+  await allOff();
+  await send("PROGRAM_OFF");
+}
+
+/* ----------------------------------------
+   CONNECTER ARDUINO
+---------------------------------------- */
+document.getElementById("btnConnect").onclick = async () => {
+  if(!("serial" in navigator)){ alert("Web Serial non supporté !"); return; }
+
+  port = await navigator.serial.requestPort();
+  await port.open({baudRate:115200});
+  writer = port.writable.getWriter();
+  log("Port série OK");
+};
+
+/* ----------------------------------------
+   BOUTONS
+---------------------------------------- */
+document.getElementById("btnStart").onclick = ()=>startProgram();
+document.getElementById("btnStop").onclick  = ()=>stopProgram();
+document.getElementById("btnCalibrate").onclick = ()=>{ irisHomeX=null; log("Calibration réinitialisée"); };
+
+/* ----------------------------------------
+   START CAMERA
+---------------------------------------- */
+const video = document.createElement("video");
+video.setAttribute("autoplay","");
+video.setAttribute("playsinline","");
+video.style.display="none";
+document.body.appendChild(video);
+
+navigator.mediaDevices.getUserMedia({ video:true })
+.then(stream=>{
+    video.srcObject = stream;
+    video.onloadeddata = ()=> processFrame();
+    log("Webcam OK");
+})
+.catch(err=> alert("Caméra refusée: "+err));
+
+/* ----------------------------------------
+   MEDIAPIPE SETUP
+---------------------------------------- */
+const faceMesh = new FaceMesh({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${f}`
+});
+
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+
+faceMesh.onResults(onResults);
+
+/* ----------------------------------------
+   LOOP → ENVOI IMAGE POUR DETECTION
+---------------------------------------- */
+async function processFrame(){
+  await faceMesh.send({image:video});
+  requestAnimationFrame(processFrame);
+}
+
+/* ----------------------------------------
+   LANDMARK INDICES
+---------------------------------------- */
+const IDX = {
+  mouthUp: 13, mouthDown: 14,
+  leftEyeTop:159, leftEyeBottom:145,
+  rightEyeTop:386,rightEyeBottom:374,
+  irisRight:[473,474,475,476,477]
+};
+
+/* ----------------------------------------
+   ONRESULTS = logique complète
+---------------------------------------- */
+async function onResults(res){
+  ctx.drawImage(res.image,0,0,canvas.width,canvas.height);
+
+  if(!res.multiFaceLandmarks) return;
+
+  const lm = res.multiFaceLandmarks[0];
+
+  const px = (p)=>({x:p.x*canvas.width,y:p.y*canvas.height});
+  const dist = (a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+
+  const mouthUp = px(lm[IDX.mouthUp]);
+  const mouthDown = px(lm[IDX.mouthDown]);
+  const faceH = dist(px(lm[10]),px(lm[152]));
+  const mouthRatio = dist(mouthUp,mouthDown)/faceH;
+
+  // bouche → start
+  if(!programActive && mouthRatio > parseFloat(thMouth.value)){
+    await startProgram();
+  }
+
+  if(!programActive) return;
+
+  // calibrer iris
+  const irisR = IDX.irisRight.map(i=>lm[i]).map(px)
+    .reduce((a,b)=>({x:a.x+b.x,y:a.y+b.y}));
+  irisR.x/=5; irisR.y/=5;
+
+  if(irisHomeX===null) irisHomeX = irisR.x;
+
+  const dx = irisR.x - irisHomeX;
+
+  // yeux
+  const lOpen = dist(px(lm[IDX.leftEyeTop]),px(lm[IDX.leftEyeBottom]))/faceH;
+  const rOpen = dist(px(lm[IDX.rightEyeTop]),px(lm[IDX.rightEyeBottom]))/faceH;
+  const leftClosed = lOpen < 0.015;
+  const rightClosed = rOpen < 0.015;
+
+  // DEUX YEUX FERMÉS 2 sec
+  if(leftClosed && rightClosed){
+    if(!bothClosedStart) bothClosedStart = performance.now();
+    if(performance.now() - bothClosedStart > 2000){
+      await allOff();
+      bothClosedStart = null;
+    }
+  } else bothClosedStart = null;
+
+  const irisTh = parseFloat(thIris.value);
+
+  // iris au centre → off
+  if(Math.abs(dx)<irisTh){
+    if(out2||out3){ await setOut2(false); await setOut3(false); }
+  } else {
+    if(leftClosed && dx < -irisTh){ await setOut2(true); await setOut3(false); }
+    if(leftClosed && dx >  irisTh){ await setOut3(true); await setOut2(false); }
+  }
+}
+</script>
+</body>
+</html>
