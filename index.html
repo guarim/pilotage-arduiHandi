@@ -19,7 +19,7 @@
 </head>
 <body>
   <div id="left">
-    <canvas id="videoCanvas" width="1280" height="720"></canvas>
+    <canvas id="videoCanvas" width="640" height="480" autoplay></canvas>
     <div id="controls">
       <button id="btnConnect">Connecter port série</button>
       <button id="btnStart">Forcer START</button>
@@ -28,7 +28,7 @@
     </div>
     <div id="logs"></div>
   </div>
-
+ 
   <div id="right">
     <h3>Statut</h3>
     <div class="stat">Programme actif : <span id="statActive">NON</span></div>
@@ -260,8 +260,8 @@
     onFrame: async () => {
       await faceMesh.send({image: videoElement});
     },
-    width: 1280,
-    height: 720
+    width: 620,
+    height: 480
   });
   await camera.start();
 
@@ -452,3 +452,4 @@
 
 </body>
 </html>
+
