@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <title>Contrôle Facial - Bouche & Iris</title>
+    <title>Contrôle Facial - Bouche & Iris by Guarim</title>
     <style>
         body { font-family: monospace; background: #222; color: #fff; text-align: center; }
         video { transform: scaleX(-1); display: none; } /* Miroir, caché car on dessine sur le canvas */
@@ -18,13 +18,17 @@
 </head>
 <body>
 
-    <h1>Interface de Contrôle : Bouche & Iris</h1>
+    <h1>Interface de Contrôle : Bouche & Iris par M Guarim</h1>
     <button id="connectBtn">🔌 Connecter Arduino (USB)</button>
     <div id="status">Système: <span class="inactive">EN ATTENTE</span> | Arduino: <span class="inactive">DÉCONNECTÉ</span></div>
     <div id="debug">...</div>
-    
-    <canvas id="output_canvas" width="640" height="480"></canvas>
-    <video id="input_video" width="640" height="480" autoplay muted></video>
+
+    <div class="container">
+        <video id="video" width="640" height="480" autoplay></video>
+        <canvas id="output_canvas" width="640" height="480"></canvas>
+    </div>
+    <!--canvas id="output_canvas" width="640" height="480"></canvas>
+    <video id="input_video" width="640" height="480" autoplay muted></video>-->
 
 <script>
     const videoElement = document.getElementById('input_video');
@@ -207,3 +211,4 @@
 </script>
 </body>
 </html>
+
