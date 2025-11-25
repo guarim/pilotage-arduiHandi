@@ -448,8 +448,18 @@
 
   // Initial log
   log('Page prête. Autorise la caméra et le port série si nécessaire.');
+  // Lancer la webcam
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await faceMesh.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        camera.start();
 </script>
 
 </body>
 </html>
+
 
