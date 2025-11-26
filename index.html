@@ -2,134 +2,262 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Eye Control + Arduino UNO</title>
+<title>Eye Control + Arduino UNO (Full version)</title>
 
 <style>
 body {
   font-family: Arial;
-  background: #222;
+  background: #202020;
   color: #eee;
+  display: flex;
+  gap: 20px;
+}
+#leftPanel {
+  flex: 1;
 }
 #video {
   width: 480px;
   border: 2px solid #444;
-}
-#status {
-  color: #0f0;
-  margin-top: 10px;
+  border-radius: 5px;
 }
 button {
   margin: 5px;
   padding: 10px;
 }
-#debug {
-  white-space: pre;
-  background:#111;
-  padding:10px;
-  border:1px solid #333;
-  width:400px;
+#debugBox {
+  white-space: pre-line;
+  background: #111;
+  padding: 10px;
+  border: 1px solid #333;
+  width: 450px;
+  height: 400px;
+  overflow-y: auto;
 }
+.eyeStatus {
+  padding: 4px;
+  margin: 2px 0;
+}
+.green { color: #0f0; }
+.red { color: #f00; }
 </style>
 
 </head>
 
 <body>
 
-<h2>Eye Control + Arduino UNO</h2>
+<div id="leftPanel">
+  <h2>Eye Control + Arduino UNO</h2>
 
-<video id="video" autoplay playsinline></video>
-<div id="status">Status : Initialisation...</div>
+  <video id="video" autoplay playsinline></video>
+  <div id="status">Initialisation…</div>
 
-<button id="connectBtn" disabled>Connexion Arduino</button>
-<button id="startBtn" disabled>Démarrer Tracking</button>
-<button id="stopBtn" disabled>Stop</button>
+  <button id="connectBtn" disabled>Connexion Arduino</button>
+  <button id="startBtn" disabled>Démarrer Programme</button>
+  <button id="stopBtn" disabled>Stop Programme</button>
 
-<h3>Debug</h3>
-<div id="debug"></div>
+  <h3>État des yeux</h3>
+  <div id="leftEyeInfo" class="eyeStatus"></div>
+  <div id="rightEyeInfo" class="eyeStatus"></div>
+  <div id="irisInfo" class="eyeStatus"></div>
+</div>
+
+<div>
+  <h3>Debug</h3>
+  <div id="debugBox"></div>
+</div>
 
 <script type="module">
 
-//------------------------------------
-// 1. Activer webcam
-//------------------------------------
-const video = document.getElementById("video");
-const statusTxt = document.getElementById("status");
-const connectBtn = document.getElementById("connectBtn");
-const startBtn = document.getElementById("startBtn");
-const stopBtn = document.getElementById("stopBtn");
-const debug = document.getElementById("debug");
+// ------------------------------------------------------------
+//  1. Import MediaPipe
+// ------------------------------------------------------------
+import {
+  FaceMesh
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+
+// ------------------------------------------------------------
+// 2. Constantes et éléments UI
+// ------------------------------------------------------------
+const video       = document.getElementById("video");
+const statusTxt   = document.getElementById("status");
+const debugBox    = document.getElementById("debugBox");
+const leftEyeInfo = document.getElementById("leftEyeInfo");
+const rightEyeInfo= document.getElementById("rightEyeInfo");
+const irisInfo    = document.getElementById("irisInfo");
+
+const connectBtn  = document.getElementById("connectBtn");
+const startBtn    = document.getElementById("startBtn");
+const stopBtn     = document.getElementById("stopBtn");
 
 let port = null;
 let writer = null;
+let tracking = false;
+let mesh = null;
 
-async function startCamera() {
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-            video: { width: 480, height: 360 }
-        });
-        video.srcObject = stream;
-        statusTxt.textContent = "Webcam OK ✔";
-        connectBtn.disabled = false;
-        startBtn.disabled = false;
-    } catch (err) {
-        statusTxt.textContent = "Erreur webcam : " + err;
-        console.error(err);
-    }
+// ------------------------------------------------------------
+// 3. EAR (Eye Aspect Ratio) pour détecter fermeture yeux
+// ------------------------------------------------------------
+function EAR(pts) {
+  const dist = (a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+  return (
+    (dist(pts[1],pts[5]) + dist(pts[2],pts[4])) /
+    (2 * dist(pts[0],pts[3]))
+  );
 }
 
+const EAR_THRESHOLD = 0.20;   // œil fermé
+const BLINK2S = 2000;         // 2 sec
+const BLINK1S = 1000;         // 1 sec
+
+let leftClosedTime = 0;
+let rightClosedTime = 0;
+
+// ------------------------------------------------------------
+// 4. Détection Iris
+// ------------------------------------------------------------
+let irisRefX = null;      // valeur de référence
+const irisMoveThreshold = 0.05;
+
+// ------------------------------------------------------------
+// 5. Arduino
+// ------------------------------------------------------------
+function send(cmd) {
+  if (!writer) return;
+  writer.write(new TextEncoder().encode(cmd + "\n"));
+}
+
+// ------------------------------------------------------------
+// 6. Initialisation WebCam
+// ------------------------------------------------------------
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:true});
+    video.srcObject = stream;
+    statusTxt.innerHTML = "Webcam OK ✔";
+    connectBtn.disabled = false;
+    startBtn.disabled = false;
+  } catch(e) {
+    statusTxt.textContent = "Erreur webcam : " + e;
+  }
+}
 startCamera();
 
-//------------------------------------
-// 2. Connexion Arduino UNO via Web Serial
-//------------------------------------
+// ------------------------------------------------------------
+// 7. Charger MediaPipe FaceMesh
+// ------------------------------------------------------------
+async function loadMesh() {
+  mesh = await FaceMesh.create({
+    baseOptions: {
+      modelAssetPath: "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.tflite"
+    },
+    runningMode: "video"
+  });
+  statusTxt.textContent = "FaceMesh chargé ✔";
+}
+loadMesh();
+
+// ------------------------------------------------------------
+// 8. Arduino Web Serial
+// ------------------------------------------------------------
 connectBtn.onclick = async () => {
-    try {
-        port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 9600 });
-        writer = port.writable.getWriter();
-        statusTxt.textContent = "Arduino connecté ✔";
-    } catch (err) {
-        alert("Erreur connexion Arduino : " + err);
-    }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600 });
+    writer = port.writable.getWriter();
+    statusTxt.textContent = "Arduino connecté ✔";
+  } catch(e) {
+    alert("Erreur Arduino : " + e);
+  }
 };
 
-function sendToArduino(cmd) {
-    if (!writer) return;
-    const data = new TextEncoder().encode(cmd + "\n");
-    writer.write(data);
-}
-
-//------------------------------------
-// 3. TRACKING — Version minimale pour vérifier webcam + boutons
-//------------------------------------
-let tracking = false;
-
+// ------------------------------------------------------------
+// 9. Programme principal
+// ------------------------------------------------------------
 startBtn.onclick = () => {
-    tracking = true;
-    statusTxt.textContent = "Tracking actif ✔";
-    debug.textContent += "Tracking démarré\n";
+  tracking = true;
+  statusTxt.textContent = "Programme actif ✔";
 };
 
 stopBtn.onclick = () => {
-    tracking = false;
-    statusTxt.textContent = "Tracking stoppé";
-    debug.textContent += "Tracking arrêté\n";
+  tracking = false;
+  statusTxt.textContent = "Programme stoppé";
+  send("0,0,0");
 };
 
-//------------------------------------
-// 4. Boucle debug (affiche juste FPS et état)
-//------------------------------------
-function loop() {
-    if (tracking) {
-        debug.textContent =
-            "Tracking ON\n" +
-            "Video frame : OK\n" +
-            "(Ici viendra la détection yeux + iris)\n";
+// ------------------------------------------------------------
+// 10. Boucle d’analyse
+// ------------------------------------------------------------
+async function loop() {
+  if (mesh && tracking) {
+    const now = performance.now();
+    const result = await mesh.detectForVideo(video, now);
+
+    if (result.faceLandmarks) {
+      const pts = result.faceLandmarks[0];
+
+      //------------------------------------------
+      // 1. EAR - détection yeux
+      //------------------------------------------
+      const left = [33,160,158,133,153,144].map(i=>pts[i]);   // gauche
+      const right= [362,385,387,263,373,380].map(i=>pts[i]);  // droit
+
+      const leftEAR  = EAR(left);
+      const rightEAR = EAR(right);
+
+      const leftClosed  = leftEAR  < EAR_THRESHOLD;
+      const rightClosed = rightEAR < EAR_THRESHOLD;
+
+      leftEyeInfo.innerHTML  = "Œil gauche : " + (leftClosed?"<span class=red>FERMÉ</span>":"<span class=green>OUVERT</span>");
+      rightEyeInfo.innerHTML = "Œil droit : "  + (rightClosed?"<span class=red>FERMÉ</span>":"<span class=green>OUVERT</span>");
+
+      //------------------------------------------
+      // Timer fermeture yeux
+      //------------------------------------------
+      if (leftClosed && rightClosed) {
+        if (!leftClosedTime) leftClosedTime = performance.now();
+        if (!rightClosedTime) rightClosedTime = performance.now();
+
+        const dur = performance.now() - leftClosedTime;
+
+        // 2 sec → Activer sortie 1
+        if (dur > BLINK2S) send("1,0,0");
+
+        // 1 sec → arrêt complet
+        if (dur > BLINK1S && dur < BLINK2S) send("0,0,0");
+
+      } else {
+        leftClosedTime = 0;
+        rightClosedTime = 0;
+      }
+
+      //------------------------------------------
+      // 2. Détection iris droit
+      //------------------------------------------
+      const irisR = pts[468]; // centre iris
+      if (irisRefX === null) irisRefX = irisR.x;
+
+      const move = irisR.x - irisRefX;
+
+      irisInfo.innerHTML = "Dév. iris droit : " + move.toFixed(3);
+
+      let out2 = 0, out3 = 0;
+
+      if (leftClosed && !rightClosed) {
+        // vers la gauche
+        if (move < -irisMoveThreshold) out2 = 1;
+        // vers la droite
+        if (move >  irisMoveThreshold) out3 = 1;
+      }
+
+      // envoyer commandes Arduino
+      send(`0,${out2},${out3}`);
     }
-    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
 }
 loop();
 
 </script>
 </body>
 </html>
+
