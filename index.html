@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Contrôle Arduino par yeux — MediaPipe + Web Serial</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial; margin: 0; display: flex; height: 100vh; }
+  #left { flex: 1; background: #111; color: #fff; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; padding: 12px; gap:10px; }
+  #canvasWrapper { position: relative; width: 640px; max-width: 92vw; }
+  video, canvas { border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.6); }
+  #controls { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  button { padding: 8px 12px; border-radius:6px; border: none; cursor:pointer; background:#1976d2; color:white; }
+  button.secondary { background:#666; }
+  #sidebar { width: 320px; min-width: 260px; background:#f6f7fb; padding:14px; box-sizing:border-box; border-left:1px solid #ddd; overflow:auto; }
+  .row { display:flex; justify-content:space-between; margin:6px 0; font-size:14px; }
+  .big { font-weight:700; font-size:16px; }
+  .status { padding:6px 8px; border-radius:6px; background:#fff; border:1px solid #ddd; }
+  #log { height: 180px; overflow:auto; background:#fff; padding:8px; border-radius:6px; border:1px solid #ddd; font-family:monospace; font-size:12px; }
+  .green { color: #0a7; font-weight:700; }
+  .red { color:#d43; font-weight:700; }
+  small.note { color:#666; display:block; margin-top:8px; }
+</style>
+</head>
+<body>
+
+<div id="left">
+  <h2>Contrôle Arduino par yeux (MediaPipe FaceMesh)</h2>
+
+  <div id="canvasWrapper">
+    <video id="video" autoplay muted playsinline style="width:640px; height:480px; display:block;"></video>
+    <canvas id="overlay" width="640" height="480" style="position:absolute; left:0; top:0;"></canvas>
+  </div>
+
+  <div id="controls">
+    <button id="btnStartCam">Démarrer caméra</button>
+    <button id="btnCalib" class="secondary">Calibrer position neutre (3s)</button>
+    <button id="btnConnect" class="secondary">Connecter Arduino (Web Serial)</button>
+    <button id="btnReset" class="secondary">Réinitialiser sorties</button>
+  </div>
+
+  <small class="note">Gestes : fermer les 2 yeux 2s → lancer (START). Fermer les 2 yeux 1s (si déjà lancé) → stop (STOPALL). Fermer œil gauche + déplacer iris droit à gauche/droite → OUT2/OUT3. Remettre iris au centre → OFF sorties 2 & 3.</small>
+</div>
+
+<div id="sidebar">
+  <h3>Telemetry & commandes</h3>
+
+  <div class="row"><div>Programme actif</div><div id="isRunning" class="status">non</div></div>
+  <div class="row"><div>Connexion Arduino</div><div id="serialState" class="status">non connecté</div></div>
+
+  <hr>
+
+  <div class="row"><div>Œil gauche</div><div id="leftState" class="status">—</div></div>
+  <div class="row"><div>Œil droit</div><div id="rightState" class="status">—</div></div>
+  <div class="row"><div>EAR gauche</div><div id="earL">0.00</div></div>
+  <div class="row"><div>EAR droit</div><div id="earR">0.00</div></div>
+
+  <div class="row"><div>Iris droit ratio</div><div id="irisRratio">0.50</div></div>
+  <div class="row"><div>Iris gauche ratio</div><div id="irisLratio">0.50</div></div>
+
+  <div class="row"><div>Sortie active</div><div id="outputs" class="big">aucune</div></div>
+
+  <hr>
+  <div><b>Calibration</b></div>
+  <div class="row"><div>Centre neutre (R)</div><div id="calibR">0.50</div></div>
+  <div class="row"><div>Centre neutre (L)</div><div id="calibL">0.50</div></div>
+
+  <hr>
+  <div><b>Log</b></div>
+  <div id="log"></div>
+</div>
+
+<!-- MediaPipe Face Mesh -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.4/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.4/drawing_utils.js"></script>
+
+<script>
+/* -----------------------------
+   Paramètres et variables
+   ----------------------------- */
+const EAR_THRESHOLD = 0.23;        // en dessous = œil fermé (à calibrer)
+const BOTH_CLOSE_START_MS = 2000;  // fermer 2s pour START
+const BOTH_CLOSE_STOP_MS = 1000;   // fermer 1s pour STOP quand running
+const IRIS_LEFT_CUTOFF = 0.40;     // ratio < -> gauche
+const IRIS_RIGHT_CUTOFF = 0.60;    // ratio > -> droite
+const CALIB_DURATION_MS = 3000;
+
+let videoElem = document.getElementById('video');
+let overlay = document.getElementById('overlay');
+let ctx = overlay.getContext('2d');
+
+let isRunning = false;
+let serialPort = null;
+let serialWriter = null;
+
+let bothClosedSince = null;
+let lastBothClosedState = false;
+
+let outputs = { out1:false, out2:false, out3:false };
+
+let calib = { r_center: 0.5, l_center: 0.5, calibrated:false };
+
+const logEl = document.getElementById('log');
+function log(msg) { 
+  let t = new Date().toLocaleTimeString();
+  logEl.innerHTML = `[${t}] ${msg}<br>` + logEl.innerHTML;
+}
+
+/* -----------------------------
+   Helpers math
+   ----------------------------- */
+function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+/* -----------------------------
+   Indices MediaPipe (468 points)
+   Eyes landmarks chosen standard:
+   left eye: [33, 160, 158, 133, 153, 144]
+   right eye: [263, 387, 385, 362, 380, 373]
+   We'll compute EAR and eye corner centers.
+   ----------------------------- */
+const L_IDX = { p1:33, p2:160, p3:158, p4:133, p5:153, p6:144 };
+const R_IDX = { p1:263, p2:387, p3:385, p4:362, p5:380, p6:373 };
+
+/* -----------------------------
+   EAR calc
+   ----------------------------- */
+function computeEAR(landmarks, idxObj){
+  let p1 = landmarks[idxObj.p1];
+  let p2 = landmarks[idxObj.p2];
+  let p3 = landmarks[idxObj.p3];
+  let p4 = landmarks[idxObj.p4];
+  let p5 = landmarks[idxObj.p5];
+  let p6 = landmarks[idxObj.p6];
+
+  // landmarks provided are normalized (x,y,z) -> convert to pixels later if needed but ratios are same
+  let A = dist({x:p2.x,y:p2.y},{x:p6.x,y:p6.y});
+  let B = dist({x:p3.x,y:p3.y},{x:p5.x,y:p5.y});
+  let C = dist({x:p1.x,y:p1.y},{x:p4.x,y:p4.y});
+  let ear = (A + B) / (2.0 * C);
+  return ear;
+}
+
+/* -----------------------------
+   Iris horizontal ratio (0..1) inside eye box
+   We'll approximate by projecting the "center" of the eye (average of vertical landmarks)
+   and normalizing between left-corner (p1) and right-corner (p4)
+   ----------------------------- */
+function computeIrisRatio(landmarks, idxObj){
+  let left = landmarks[idxObj.p1];
+  let right = landmarks[idxObj.p4];
+
+  // vertical center = average of p2..p6
+  let vxs = 0, vys=0, count=0;
+  [idxObj.p2, idxObj.p3, idxObj.p5, idxObj.p6].forEach(i=>{
+    vxs += landmarks[i].x; vys += landmarks[i].y; count++;
+  });
+  let center = { x: vxs/count, y: vys/count };
+
+  // ratio along horizontal axis
+  let total = right.x - left.x;
+  if (Math.abs(total) < 1e-6) return 0.5;
+  let ratio = (center.x - left.x) / total;
+  // clamp
+  ratio = Math.max(0, Math.min(1, ratio));
+  return ratio;
+}
+
+/* -----------------------------
+   MediaPipe FaceMesh setup
+   ----------------------------- */
+const faceMesh = new FaceMesh.FaceMesh({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`
+});
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: true, // includes iris details, helpful
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+
+faceMesh.onResults(onResults);
+
+/* -----------------------------
+   Camera
+   ----------------------------- */
+let camera = null;
+document.getElementById('btnStartCam').onclick = async () => {
+  if (camera) { camera.stop(); camera = null; document.getElementById('btnStartCam').innerText = 'Démarrer caméra'; return; }
+  document.getElementById('btnStartCam').innerText = 'Initialisation...';
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { width:640, height:480 } , audio:false });
+  videoElem.srcObject = stream;
+  await videoElem.play();
+  camera = new Camera.Camera(videoElem, {
+    onFrame: async () => {
+      await faceMesh.send({image: videoElem});
+    },
+    width: 640,
+    height: 480
+  });
+  camera.start();
+  document.getElementById('btnStartCam').innerText = 'Arrêter caméra';
+  log('Caméra démarrée');
+};
+
+/* -----------------------------
+   Calibration automatique sur 3s
+   ----------------------------- */
+document.getElementById('btnCalib').onclick = async () => {
+  log('Calibration démarrée : maintenez regard au centre pendant 3s');
+  let samplesR = [];
+  let samplesL = [];
+  const duration = CALIB_DURATION_MS;
+  const t0 = performance.now();
+  const sampleFn = (resolve) => {
+    const step = () => {
+      if (!lastLandmarks) { if (performance.now() - t0 < duration) { requestAnimationFrame(step); } else resolve(); return; }
+      const lratio = computeIrisRatio(lastLandmarks, L_IDX);
+      const rratio = computeIrisRatio(lastLandmarks, R_IDX);
+      samplesL.push(lratio);
+      samplesR.push(rratio);
+      if (performance.now() - t0 < duration) requestAnimationFrame(step); else resolve();
+    };
+    step();
+  };
+  await new Promise(sampleFn);
+  if (samplesR.length>0) {
+    calib.r_center = samplesR.reduce((a,b)=>a+b,0)/samplesR.length;
+    calib.l_center = samplesL.reduce((a,b)=>a+b,0)/samplesL.length;
+    calib.calibrated = true;
+    document.getElementById('calibR').innerText = calib.r_center.toFixed(2);
+    document.getElementById('calibL').innerText = calib.l_center.toFixed(2);
+    log('Calibration terminée');
+  } else {
+    log('Calibration échouée (pas de visage détecté)');
+  }
+};
+
+/* -----------------------------
+   Web Serial — connexion Arduino
+   ----------------------------- */
+document.getElementById('btnConnect').onclick = async () => {
+  try {
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 9600 });
+    serialWriter = serialPort.writable.getWriter();
+    document.getElementById('serialState').innerText = 'connecté';
+    document.getElementById('serialState').classList.add('green');
+    log('Port série connecté');
+    // Drain any incoming bytes (optional)
+    // no read loop implemented (we only write)
+  } catch (e) {
+    log('Erreur connexion série : ' + e);
+  }
+};
+
+document.getElementById('btnReset').onclick = () => {
+  sendCmd('STOPALL');
+  outputs = { out1:false, out2:false, out3:false };
+  updateOutputsUI();
+};
+
+/* -----------------------------
+   Sending to Arduino helper
+   ----------------------------- */
+async function sendCmd(cmd) {
+  log('→ ' + cmd);
+  if (!serialWriter) { log('Avertissement : Arduino non connecté, commande non envoyée'); return; }
+  try {
+    const data = new TextEncoder().encode(cmd + '\\n');
+    await serialWriter.write(data);
+  } catch (e) {
+    log('Erreur envoi série: ' + e);
+  }
+}
+
+/* -----------------------------
+   UI updates
+   ----------------------------- */
+function updateOutputsUI(){
+  const o = [];
+  if (outputs.out1) o.push('OUT1');
+  if (outputs.out2) o.push('OUT2');
+  if (outputs.out3) o.push('OUT3');
+  document.getElementById('outputs').innerText = o.length? o.join(', ') : 'aucune';
+  document.getElementById('isRunning').innerText = isRunning ? 'oui' : 'non';
+  document.getElementById('isRunning').className = 'status ' + (isRunning ? 'green' : '');
+}
+
+/* -----------------------------
+   Drawing utilities
+   ----------------------------- */
+function drawLandmarks(landmarks){
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+  // draw mesh simplified
+  for (let i=0;i<landmarks.length;i++){
+    const p = landmarks[i];
+    ctx.fillStyle = 'rgba(0,255,150,0.7)';
+    ctx.beginPath();
+    ctx.arc(p.x * overlay.width, p.y * overlay.height, 1.3, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+/* -----------------------------
+   Main results handler
+   ----------------------------- */
+let lastLandmarks = null;
+
+function onResults(results){
+  if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length===0) return;
+  const landmarks = results.multiFaceLandmarks[0];
+  lastLandmarks = landmarks;
+
+  // convert normalized to pixel coords (for drawing)
+  const pixelLandmarks = landmarks.map(p => ({ x: p.x, y: p.y }));
+
+  drawLandmarks(pixelLandmarks);
+
+  // compute EARs
+  const earL = computeEAR(landmarks, L_IDX);
+  const earR = computeEAR(landmarks, R_IDX);
+  document.getElementById('earL').innerText = earL.toFixed(3);
+  document.getElementById('earR').innerText = earR.toFixed(3);
+
+  // eye open/closed
+  const leftClosed = earL < EAR_THRESHOLD;
+  const rightClosed = earR < EAR_THRESHOLD;
+  document.getElementById('leftState').innerText = leftClosed ? 'fermée' : 'ouverte';
+  document.getElementById('rightState').innerText = rightClosed ? 'fermée' : 'ouverte';
+  document.getElementById('leftState').className = 'status ' + (leftClosed ? 'red' : 'green');
+  document.getElementById('rightState').className = 'status ' + (rightClosed ? 'red' : 'green');
+
+  // iris ratios
+  const irisR = computeIrisRatio(landmarks, R_IDX);
+  const irisL = computeIrisRatio(landmarks, L_IDX);
+  document.getElementById('irisRratio').innerText = irisR.toFixed(2);
+  document.getElementById('irisLratio').innerText = irisL.toFixed(2);
+
+  // Determine if both eyes closed
+  const now = performance.now();
+  if (leftClosed && rightClosed) {
+    if (!bothClosedSince) bothClosedSince = now;
+    const dt = now - bothClosedSince;
+
+    // if not running and both closed >= 2s -> START
+    if (!isRunning && dt >= BOTH_CLOSE_START_MS) {
+      isRunning = true;
+      outputs.out1 = true;
+      sendCmd('START');
+      updateOutputsUI();
+      log('Gesture: both eyes closed >= 2s => START');
+      // reset timer so subsequent long close won't also STOP immediately
+      bothClosedSince = now; 
+    }
+
+    // if running and both closed >= 1s -> STOPALL
+    if (isRunning && dt >= BOTH_CLOSE_STOP_MS && dt < BOTH_CLOSE_START_MS) {
+      // if isRunning, but we don't want START again; interpret this as STOP gesture
+      isRunning = false;
+      outputs.out1 = false; outputs.out2 = false; outputs.out3 = false;
+      sendCmd('STOPALL');
+      updateOutputsUI();
+      log('Gesture: both eyes closed >= 1s while running => STOPALL');
+      bothClosedSince = null;
+    }
+
+  } else {
+    // reset bothClosed timer
+    bothClosedSince = null;
+  }
+
+  // If program is running, process directional controls:
+  if (isRunning) {
+    // Condition: left eye closed AND right eye open
+    if (leftClosed && !rightClosed) {
+      // Compare irisR relative to calibrated center if available
+      const centerR = calib.calibrated ? calib.r_center : 0.5;
+      // normalize to difference
+      const rel = irisR - centerR;
+      // decide left/right
+      if (irisR < (calib.calibrated ? centerR - 0.12 : IRIS_LEFT_CUTOFF)) {
+        // move left -> OUT2 ON
+        if (!outputs.out2) {
+          outputs.out2 = true;
+          sendCmd('OUT2_ON');
+          log('Command: OUT2_ON (right iris left)');
+        }
+        // ensure out3 off
+        if (outputs.out3) { outputs.out3 = false; sendCmd('OUT3_OFF'); }
+      } else if (irisR > (calib.calibrated ? centerR + 0.12 : IRIS_RIGHT_CUTOFF)) {
+        // move right -> OUT3 ON
+        if (!outputs.out3) {
+          outputs.out3 = true;
+          sendCmd('OUT3_ON');
+          log('Command: OUT3_ON (right iris right)');
+        }
+        // ensure out2 off
+        if (outputs.out2) { outputs.out2 = false; sendCmd('OUT2_OFF'); }
+      } else {
+        // center -> turn off out2 & out3
+        if (outputs.out2) { outputs.out2 = false; sendCmd('OUT2_OFF'); log('Command: OUT2_OFF (center)'); }
+        if (outputs.out3) { outputs.out3 = false; sendCmd('OUT3_OFF'); log('Command: OUT3_OFF (center)'); }
+      }
+    } else {
+      // if not (left closed & right open) then ensure out2/out3 off
+      if (outputs.out2) { outputs.out2 = false; sendCmd('OUT2_OFF'); log('OUT2_OFF (condition not met)'); }
+      if (outputs.out3) { outputs.out3 = false; sendCmd('OUT3_OFF'); log('OUT3_OFF (condition not met)'); }
+    }
+  }
+
+  updateOutputsUI();
+}
+
+/* -----------------------------
+   Cleanup on page close
+   ----------------------------- */
+window.addEventListener('beforeunload', async (e) => {
+  try {
+    if (serialWriter) { await serialWriter.close(); serialWriter = null; }
+    if (serialPort) { await serialPort.close(); serialPort = null; }
+  } catch(e){}
+});
+</script>
+</body>
+</html>
