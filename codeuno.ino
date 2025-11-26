@@ -1,71 +1,35 @@
-// Définition des broches
-const int PIN_SORTIE_1 = 2; // Programme lancé
-const int PIN_SORTIE_2 = 3; // Iris Gauche
-const int PIN_SORTIE_3 = 4; // Iris Droite
-
-String inputString = "";      
-bool stringComplete = false;  
+int out1 = 3;   // fermeture 2s
+int out2 = 5;   // œil gauche fermé + iris gauche
+int out3 = 7;   // œil gauche fermé + iris droite
 
 void setup() {
-  Serial.begin(9600); // Doit correspondre au débit dans le JS
-  
-  pinMode(PIN_SORTIE_1, OUTPUT);
-  pinMode(PIN_SORTIE_2, OUTPUT);
-  pinMode(PIN_SORTIE_3, OUTPUT);
-  
-  // Tout éteindre au démarrage
-  stopAll();
+  Serial.begin(9600);
+  pinMode(out1, OUTPUT);
+  pinMode(out2, OUTPUT);
+  pinMode(out3, OUTPUT);
+
+  digitalWrite(out1, LOW);
+  digitalWrite(out2, LOW);
+  digitalWrite(out3, LOW);
 }
 
 void loop() {
-  // Traitement de la commande reçue
-  if (stringComplete) {
-    inputString.trim(); // Enlever les espaces et sauts de ligne
-    
-    if (inputString == "CMD_START") {
-      digitalWrite(PIN_SORTIE_1, HIGH); // Activer sortie 1
-    } 
-    else if (inputString == "CMD_STOP_ALL") {
-      stopAll(); // Tout désactiver
-    }
-    else if (inputString == "CMD_OUT2_ON") {
-      // Sécurité : on active 2 seulement si 1 est actif
-      if(digitalRead(PIN_SORTIE_1) == HIGH) {
-        digitalWrite(PIN_SORTIE_2, HIGH);
-        digitalWrite(PIN_SORTIE_3, LOW); // Exclusif (optionnel)
-      }
-    }
-    else if (inputString == "CMD_OUT3_ON") {
-      if(digitalRead(PIN_SORTIE_1) == HIGH) {
-        digitalWrite(PIN_SORTIE_3, HIGH);
-        digitalWrite(PIN_SORTIE_2, LOW); // Exclusif (optionnel)
-      }
-    }
-    else if (inputString == "CMD_OUT23_OFF") {
-      digitalWrite(PIN_SORTIE_2, LOW);
-      digitalWrite(PIN_SORTIE_3, LOW);
-    }
-    
-    // Reset
-    inputString = "";
-    stringComplete = false;
-  }
-}
+  if (Serial.available()) {
+    String s = Serial.readStringUntil('\n');
+    s.trim();
 
-// Lecture du port série
-void serialEvent() {
-  while (Serial.available()) {
-    char inChar = (char)Serial.read();
-    if (inChar == '\n') {
-      stringComplete = true;
-    } else {
-      inputString += inChar;
+    // format : a,b,c
+    int idx1 = s.indexOf(',');
+    int idx2 = s.lastIndexOf(',');
+
+    if (idx1>0 && idx2>idx1) {
+      int a = s.substring(0, idx1).toInt();
+      int b = s.substring(idx1+1, idx2).toInt();
+      int c = s.substring(idx2+1).toInt();
+
+      digitalWrite(out1, a);
+      digitalWrite(out2, b);
+      digitalWrite(out3, c);
     }
   }
-}
-
-void stopAll() {
-  digitalWrite(PIN_SORTIE_1, LOW);
-  digitalWrite(PIN_SORTIE_2, LOW);
-  digitalWrite(PIN_SORTIE_3, LOW);
 }
